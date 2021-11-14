@@ -395,6 +395,8 @@ class TrainingArguments:
     do_train: bool = field(default=False, metadata={"help": "Whether to run training."})
     do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the dev set."})
     do_predict: bool = field(default=False, metadata={"help": "Whether to run predictions on the test set."})
+    do_search: bool = field(default=False, metadata={"help": "Whether to run search on the dev set."})
+    search_iters: int = field(default=20, metadata={"help": "Number of search iterations on the dev set."})
     evaluation_strategy: IntervalStrategy = field(
         default="no",
         metadata={"help": "The evaluation strategy to use."},

@@ -232,6 +232,8 @@ class BertSelfAttention(nn.Module):
                 f"heads ({config.num_attention_heads})"
             )
 
+        self.layer_idx = config.layer_idx
+
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
@@ -249,6 +251,7 @@ class BertSelfAttention(nn.Module):
             self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
         self.is_decoder = config.is_decoder
+        self.head_prune = False
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -260,6 +263,7 @@ class BertSelfAttention(nn.Module):
         hidden_states,
         attention_mask=None,
         head_mask=None,
+        head_random_noise=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         past_key_value=None,
@@ -334,6 +338,23 @@ class BertSelfAttention(nn.Module):
         attention_probs = self.dropout(attention_probs)
 
         # Mask heads if we want to
+        if self.head_prune and head_random_noise is not None:
+            head_mask = torch.ones(self.num_attention_heads).cuda()
+            head_mask += head_random_noise * 0.1
+            head_mask = head_mask.reshape(1, -1, 1, 1)
+
+        '''
+        if self.layer_idx == head_mask_layer_idx:
+            #head_mask = [1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1]
+            #head_mask = [0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1]
+            head_mask = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+            for i in [2, 3, 11]:
+                head_mask[i - 1] = 0
+            head_mask = torch.tensor(head_mask).cuda()
+            print(head_mask)
+            head_mask = head_mask.reshape(1, -1, 1, 1)
+        '''
+        
         if head_mask is not None:
             attention_probs = attention_probs * head_mask
 
@@ -394,6 +415,7 @@ class BertAttention(nn.Module):
         hidden_states,
         attention_mask=None,
         head_mask=None,
+        head_random_noise=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         past_key_value=None,
@@ -403,6 +425,7 @@ class BertAttention(nn.Module):
             hidden_states,
             attention_mask,
             head_mask,
+            head_random_noise,
             encoder_hidden_states,
             encoder_attention_mask,
             past_key_value,
@@ -431,11 +454,26 @@ class BertIntermediate(nn.Module):
 class BertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.intermediate_size = config.intermediate_size
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.layer_idx = config.layer_idx
+        self.ff_prune = False
+        self.ff_mask = None
 
-    def forward(self, hidden_states, input_tensor):
+    def forward(self, hidden_states, input_tensor, ff_random_noise):
+        if self.ff_prune and ff_random_noise is not None:
+            print('HERE!')
+            ff_mask = torch.ones(self.intermediate_size).cuda()
+            ff_mask += ff_random_noise * 0.1
+            ff_mask = ff_mask.reshape(1, 1, -1)
+            hidden_states = hidden_states * ff_mask
+
+        if self.ff_mask is not None:
+            print('PRUNE!!')
+            hidden_states = hidden_states * self.ff_mask.reshape(1, 1, -1)
+
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
@@ -443,8 +481,10 @@ class BertOutput(nn.Module):
 
 
 class BertLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, idx):
         super().__init__()
+        config.layer_idx = idx
+        self.layer_idx = idx
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
         self.attention = BertAttention(config)
@@ -462,6 +502,8 @@ class BertLayer(nn.Module):
         hidden_states,
         attention_mask=None,
         head_mask=None,
+        head_random_noise=None,
+        ff_random_noise=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         past_key_value=None,
@@ -473,6 +515,7 @@ class BertLayer(nn.Module):
             hidden_states,
             attention_mask,
             head_mask,
+            head_random_noise,
             output_attentions=output_attentions,
             past_key_value=self_attn_past_key_value,
         )
@@ -510,9 +553,9 @@ class BertLayer(nn.Module):
             cross_attn_present_key_value = cross_attention_outputs[-1]
             present_key_value = present_key_value + cross_attn_present_key_value
 
-        layer_output = apply_chunking_to_forward(
-            self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
-        )
+        intermediate_output = self.intermediate(attention_output)
+        layer_output = self.output(intermediate_output, attention_output, ff_random_noise)
+
         outputs = (layer_output,) + outputs
 
         # if decoder, return the attn key/values as the last output
@@ -521,17 +564,12 @@ class BertLayer(nn.Module):
 
         return outputs
 
-    def feed_forward_chunk(self, attention_output):
-        intermediate_output = self.intermediate(attention_output)
-        layer_output = self.output(intermediate_output, attention_output)
-        return layer_output
-
 
 class BertEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layer = nn.ModuleList([BertLayer(config, i) for i in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
     def forward(
@@ -539,6 +577,8 @@ class BertEncoder(nn.Module):
         hidden_states,
         attention_mask=None,
         head_mask=None,
+        head_random_noise=None,
+        ff_random_noise=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         past_key_values=None,
@@ -578,6 +618,8 @@ class BertEncoder(nn.Module):
                     hidden_states,
                     attention_mask,
                     layer_head_mask,
+                    head_random_noise,
+                    ff_random_noise,
                     encoder_hidden_states,
                     encoder_attention_mask,
                 )
@@ -586,6 +628,8 @@ class BertEncoder(nn.Module):
                     hidden_states,
                     attention_mask,
                     layer_head_mask,
+                    head_random_noise,
+                    ff_random_noise,
                     encoder_hidden_states,
                     encoder_attention_mask,
                     past_key_value,
@@ -900,6 +944,8 @@ class BertModel(BertPreTrainedModel):
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
+        head_random_noise=None,
+        ff_random_noise=None,
         inputs_embeds=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
@@ -999,6 +1045,8 @@ class BertModel(BertPreTrainedModel):
             embedding_output,
             attention_mask=extended_attention_mask,
             head_mask=head_mask,
+            head_random_noise=head_random_noise,
+            ff_random_noise=ff_random_noise,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_extended_attention_mask,
             past_key_values=past_key_values,
@@ -1054,6 +1102,8 @@ class BertForPreTraining(BertPreTrainedModel):
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
+        head_random_noise=None,
+        ff_random_noise=None,
         inputs_embeds=None,
         labels=None,
         next_sentence_label=None,
@@ -1099,6 +1149,8 @@ class BertForPreTraining(BertPreTrainedModel):
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             head_mask=head_mask,
+            head_random_noise=head_random_noise,
+            ff_random_noise=ff_random_noise,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1503,40 +1555,61 @@ class BertForSequenceClassification(BertPreTrainedModel):
 
         self.init_weights()
 
-    @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
-    @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=SequenceClassifierOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
-    def forward(
+        self.head_grad_approx = torch.zeros(config.num_attention_heads).cuda()
+        self.ff_grad_approx = torch.zeros(config.intermediate_size).cuda()
+
+        self.baseline_loss = None
+        self.set_search_mode(False)
+        self.set_search_iters(0)
+        self.ff_prune_idx = None
+
+    def set_search_mode(self, search_mode):
+        self.search_mode = search_mode
+
+    def set_search_iters(self, iters):
+        self.search_iters = iters
+
+    def set_ff_pruning_layer(self, idx):
+        self.bert.encoder.layer[idx].output.ff_prune = True
+        self.ff_prune_idx = idx
+
+    def set_head_pruning_layer(self, idx):
+        raise NotImplementedError #TODO
+
+    def prune_ff(self, num=1500, largest=True):
+        print(f'prune top {num} ' + ('largest' if largest else 'smallest') + ' channels')
+        target = torch.topk(self.ff_grad_approx, num, largest=largest)
+        print(target.values)
+        self.bert.encoder.layer[self.ff_prune_idx].output.ff_mask = torch.tensor(
+                [float(i not in target.indices) for i in range(self.config.intermediate_size)]
+            ).cuda()
+        #print(self.bert.encoder.layer[self.ff_prune_idx].output.ff_mask)
+        #print(self.bert.encoder.layer[self.ff_prune_idx].output.ff_mask.sum())
+        
+
+    def compute_loss(
         self,
         input_ids=None,
         attention_mask=None,
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
+        head_random_noise=None,
+        ff_random_noise=None,
         inputs_embeds=None,
         labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
     ):
-        r"""
-        labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
-            Labels for computing the sequence classification/regression loss. Indices should be in :obj:`[0, ...,
-            config.num_labels - 1]`. If :obj:`config.num_labels == 1` a regression loss is computed (Mean-Square loss),
-            If :obj:`config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         outputs = self.bert(
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             head_mask=head_mask,
+            head_random_noise=head_random_noise,
+            ff_random_noise=ff_random_noise,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1570,9 +1643,107 @@ class BertForSequenceClassification(BertPreTrainedModel):
             elif self.config.problem_type == "multi_label_classification":
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(logits, labels)
-        if not return_dict:
-            output = (logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
+        return loss, logits, outputs
+
+    @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        processor_class=_TOKENIZER_FOR_DOC,
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=SequenceClassifierOutput,
+        config_class=_CONFIG_FOR_DOC,
+    )
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        r"""
+        labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
+            Labels for computing the sequence classification/regression loss. Indices should be in :obj:`[0, ...,
+            config.num_labels - 1]`. If :obj:`config.num_labels == 1` a regression loss is computed (Mean-Square loss),
+            If :obj:`config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if not self.search_mode:
+            loss, logits, outputs = self.compute_loss(
+                input_ids=input_ids, 
+                attention_mask=attention_mask, 
+                token_type_ids=token_type_ids, 
+                position_ids=position_ids,
+                head_mask=head_mask, 
+                inputs_embeds=inputs_embeds, 
+                labels=labels, 
+                output_attentions=output_attentions, 
+                output_hidden_states=output_hidden_states, 
+                return_dict=return_dict
+            )
+        else:
+            for si in range(self.search_iters):
+                print(si)
+                head_random_noise = None
+
+                ff_random_noise = torch.normal(mean=torch.zeros(self.config.intermediate_size),
+                        std=torch.ones(self.config.intermediate_size)).cuda()
+
+                loss, logits, outputs = self.compute_loss(
+                    input_ids=input_ids, 
+                    attention_mask=attention_mask, 
+                    token_type_ids=token_type_ids, 
+                    position_ids=position_ids,
+                    head_mask=head_mask, 
+                    head_random_noise=head_random_noise,
+                    ff_random_noise=ff_random_noise,
+                    inputs_embeds=inputs_embeds, 
+                    labels=labels, 
+                    output_attentions=output_attentions, 
+                    output_hidden_states=output_hidden_states, 
+                    return_dict=return_dict
+                )
+
+                if head_random_noise is not None:
+                    head_grad_approx = loss * head_random_noise * 0.5
+                    head_random_noise = -head_random_noise
+
+                if ff_random_noise is not None:
+                    #self.grad_approx += (loss - self.baseline_loss) * ff_random_noise
+                    ff_grad_approx = loss * ff_random_noise * 0.5
+                    ff_random_noise = -ff_random_noise
+
+                loss, logits, outputs = self.compute_loss(
+                    input_ids=input_ids, 
+                    attention_mask=attention_mask, 
+                    token_type_ids=token_type_ids, 
+                    position_ids=position_ids,
+                    head_mask=head_mask, 
+                    head_random_noise=head_random_noise,
+                    ff_random_noise=ff_random_noise,
+                    inputs_embeds=inputs_embeds, 
+                    labels=labels, 
+                    output_attentions=output_attentions, 
+                    output_hidden_states=output_hidden_states, 
+                    return_dict=return_dict
+                )
+
+                if head_random_noise is not None:
+                    head_grad_approx += loss * head_random_noise * 0.5
+                    self.head_grad_approx += head_grad_approx / self.search_iters
+
+                if ff_random_noise is not None:
+                    #self.grad_approx += (loss - self.baseline_loss) * ff_random_noise
+                    ff_grad_approx += loss * ff_random_noise * 0.5
+                    self.ff_grad_approx += ff_grad_approx / self.search_iters
+
+            #print(torch.topk(self.ff_grad_approx, 300))
+            #print(torch.topk(self.ff_grad_approx, 300, largest=False))
 
         return SequenceClassifierOutput(
             loss=loss,

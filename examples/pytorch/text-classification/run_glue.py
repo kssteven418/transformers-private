@@ -184,6 +184,14 @@ class ModelArguments:
             "with private models)."
         },
     )
+    prune_smallest: bool = field(
+        default=False,
+        metadata={"help": "Whether to prune top-k smallest gradients"},
+    )
+    prune_layer: int = field(
+        default=0,
+        metadata={"help": "Target layer to prune"},
+    )
 
 
 def main():
@@ -417,7 +425,7 @@ def main():
         if data_args.max_train_samples is not None:
             train_dataset = train_dataset.select(range(data_args.max_train_samples))
 
-    if training_args.do_eval:
+    if training_args.do_eval or training_args.do_seach:
         if "validation" not in raw_datasets and "validation_matched" not in raw_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = raw_datasets["validation_matched" if data_args.task_name == "mnli" else "validation"]
@@ -495,6 +503,33 @@ def main():
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
+
+    # Search
+    if training_args.do_search:
+        trainer.model.set_search_mode(True)
+        trainer.model.set_search_iters(training_args.search_iters)
+        trainer.model.set_ff_pruning_layer(model_args.prune_layer) #TODO argument
+        logger.info("*** Search ***")
+
+        # Loop to handle MNLI double evaluation (matched, mis-matched)
+        tasks = [data_args.task_name]
+        eval_datasets = [eval_dataset]
+        if data_args.task_name == "mnli":
+            tasks.append("mnli-mm")
+            eval_datasets.append(raw_datasets["validation_mismatched"])
+
+        for eval_dataset, task in zip(eval_datasets, tasks):
+            metrics = trainer.evaluate(eval_dataset=eval_dataset)
+
+            max_eval_samples = (
+                data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
+            )
+            metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+
+            trainer.log_metrics("eval", metrics)
+            trainer.save_metrics("eval", metrics)
+        trainer.model.prune_ff(largest=(not model_args.prune_smallest))
+        trainer.model.set_search_mode(False)
 
     # Evaluation
     if training_args.do_eval:
